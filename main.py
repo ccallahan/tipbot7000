@@ -70,7 +70,7 @@ def index():
 def pay():
     amount = float(request.form['amount'])
     # Convert to cents
-    amount_cents = int(amount * 10)
+    amount_cents = int(amount * 100)
     idempotency_key = os.urandom(16).hex()
     body = {
         "idempotency_key": idempotency_key,
