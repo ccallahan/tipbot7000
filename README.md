@@ -34,3 +34,6 @@ python app.py
 ## Security
 - Never commit your Square API credentials to source control.
 - Use environment variables for all sensitive data.
+
+
+
