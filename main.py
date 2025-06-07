@@ -154,18 +154,22 @@ def confirm():
             # Create a new payment for the same amount
             payment_body = {
                 "idempotency_key": os.urandom(16).hex(),
-                "amount_money": {
-                    "amount": amount,
-                    "currency": "USD"
-                },
-                "source_id": "CASH",
-                "location_id": SQUARE_LOCATION_ID
+                "checkout": {
+                    "amount_money": {
+                        "amount": amount,
+                        "currency": "USD"
+                    },
+                    "device_options": {
+                        "device_id": SQUARE_DEVICE_ID,
+                        "skip_receipt_screen": True
+                    }
+                }
             }
-            pay_result = square_client.payments.create(**payment_body)
+            pay_result = square_client.terminal.checkouts.create(**payment_body)
             if pay_result.errors is None:
-                return jsonify({"result": "Second transaction successful!"})
+                return jsonify({"result": "Transaction successful!"})
             else:
-                return f"Second transaction failed: {pay_result.errors}", 400
+                return f"Transaction failed: {pay_result.errors}", 400
         else:
             return jsonify({"result": "Payment not completed yet."})
     else:
