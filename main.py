@@ -1,4 +1,6 @@
 import os
+import threading
+import time
 from flask import Flask, request, render_template_string, jsonify
 from square.client import Square
 from square.environment import SquareEnvironment as SquareEnv
@@ -66,6 +68,40 @@ def index():
     return render_template_string(FORM_HTML)
 
 
+# Store the last successful transaction time and checkout_id in memory
+last_transaction = {
+    'timestamp': None,
+    'checkout_id': None,
+    'amount': None
+}
+
+# Helper function to cancel and resubmit payment
+def schedule_resubmit(checkout_id, amount):
+    def task():
+        time.sleep(240)  # 4 minutes
+        # If no new transaction has occurred, cancel and resubmit
+        if last_transaction['checkout_id'] == checkout_id:
+            # Cancel the previous checkout
+            square_client.terminal.checkouts.cancel(checkout_id)
+            # Resubmit the payment
+            idempotency_key = os.urandom(16).hex()
+            body = {
+                "idempotency_key": idempotency_key,
+                "checkout": {
+                    "amount_money": {
+                        "amount": amount,
+                        "currency": "USD"
+                    },
+                    "device_options": {
+                        "device_id": SQUARE_DEVICE_ID,
+                        "skip_receipt_screen": True
+                    }
+                }
+            }
+            square_client.terminal.checkouts.create(**body)
+    threading.Thread(target=task, daemon=True).start()
+
+
 @app.route('/pay', methods=['POST'])
 def pay():
     amount = float(request.form['amount'])
@@ -80,7 +116,8 @@ def pay():
                 "currency": "USD"
             },
             "device_options": {
-                "device_id": SQUARE_DEVICE_ID
+                "device_id": SQUARE_DEVICE_ID,
+                "skip_receipt_screen": True
             }
         }
     }
@@ -88,6 +125,11 @@ def pay():
     if result.errors is None:
         checkout = result.checkout
         # Save checkout_id and amount for confirmation
+        last_transaction['timestamp'] = time.time()
+        last_transaction['checkout_id'] = checkout.id
+        last_transaction['amount'] = amount_cents
+        # Schedule cancel/resubmit logic
+        schedule_resubmit(checkout.id, amount_cents)
         return jsonify({"checkout_id": checkout.id, "amount": amount_cents})
     else:
         return f"Error: {result.errors}", 400
@@ -105,24 +147,25 @@ def confirm():
     if result.errors is None:
         checkout = result.checkout
         if checkout.status == 'COMPLETED':
-            # Trigger another transaction for the same amount
-            body = {
-            "idempotency_key": os.urandom(16).hex(),
-            "checkout": {
+            # Update last transaction to prevent resubmission
+            last_transaction['timestamp'] = time.time()
+            last_transaction['checkout_id'] = checkout_id
+            last_transaction['amount'] = amount
+            # Create a new payment for the same amount
+            payment_body = {
+                "idempotency_key": os.urandom(16).hex(),
                 "amount_money": {
                     "amount": amount,
                     "currency": "USD"
                 },
-                "device_options": {
-                    "device_id": SQUARE_DEVICE_ID
-                }
+                "source_id": "CASH",
+                "location_id": SQUARE_LOCATION_ID
             }
-        }
-            pay_result = square_client.terminal.checkouts.create(**body)
+            pay_result = square_client.payments.create(**payment_body)
             if pay_result.errors is None:
-                return jsonify({"result": "Transaction successful!"})
+                return jsonify({"result": "Second transaction successful!"})
             else:
-                return f"Transaction failed: {pay_result.errors}", 400
+                return f"Second transaction failed: {pay_result.errors}", 400
         else:
             return jsonify({"result": "Payment not completed yet."})
     else:
