@@ -9,7 +9,7 @@ app = Flask(__name__)
 
 SQUARE_ACCESS_TOKEN = os.getenv('SQUARE_ACCESS_TOKEN')
 SQUARE_LOCATION_ID = os.getenv('SQUARE_LOCATION_ID')
-SQUARE_DEVICE_ID = os.getenv('SQUARE_DEVICE_ID', '432CS149B8004293')
+SQUARE_DEVICE_ID = os.getenv('SQUARE_DEVICE_ID', 'da40d603-c2ea-4a65-8cfd-f42e36dab0c7')
 
 # Initialize Square client
 square_client = Square(
@@ -28,6 +28,7 @@ FORM_HTML = '''
     <input type="number" name="amount" id="amount" step="0.01" min="0.01" required style="width:100%;padding:8px;margin:8px 0;" />
     <button type="submit" style="width:100%;padding:10px;background:#0070ba;color:white;border:none;border-radius:4px;font-size:1.1em;">Pay</button>
   </form>
+  <button id="abortBtn" style="display:none;width:100%;padding:10px;background:#e53935;color:white;border:none;border-radius:4px;font-size:1.1em;">Abort Resubmission</button>
   <hr>
   <h3>Pair a Square Terminal</h3>
   <form id="pairForm" onsubmit="pairTerminal(event)">
@@ -36,6 +37,7 @@ FORM_HTML = '''
   <div id="pairResult" style="margin-top:1em;"></div>
 </div>
 <script>
+let lastCheckoutId = null;
 function pairTerminal(event) {
   event.preventDefault();
   document.getElementById('pairResult').innerHTML = 'Pairing...';
@@ -59,6 +61,30 @@ function pairTerminal(event) {
       document.getElementById('pairResult').innerHTML = 'Error: ' + e;
     });
 }
+// Listen for pay form submission to show abort button
+const payForm = document.querySelector('form[action="/pay"]');
+payForm.addEventListener('submit', function(e) {
+  setTimeout(() => {
+    fetch('/last_checkout_id').then r => r.json()).then(data => {
+      if (data.checkout_id) {
+        lastCheckoutId = data.checkout_id;
+        document.getElementById('abortBtn').style.display = 'block';
+      }
+    });
+  }, 1000);
+});
+document.getElementById('abortBtn').onclick = function() {
+  if (lastCheckoutId) {
+    fetch('/abort_resubmit', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({checkout_id: lastCheckoutId})
+    }).then(r => r.json()).then(data => {
+      alert(data.result || data.error);
+      document.getElementById('abortBtn').style.display = 'none';
+    });
+  }
+};
 </script>
 '''
 
@@ -75,31 +101,66 @@ last_transaction = {
     'amount': None
 }
 
-# Helper function to cancel and resubmit payment
+# Store abort flags for each checkout
+abort_flags = {}
+
+# Helper function to cancel and resubmit payment, looping for up to 2 hours or until abort
 def schedule_resubmit(checkout_id, amount):
     def task():
-        time.sleep(240)  # 4 minutes
-        # If no new transaction has occurred, cancel and resubmit
-        if last_transaction['checkout_id'] == checkout_id:
-            # Cancel the previous checkout
-            square_client.terminal.checkouts.cancel(checkout_id)
-            # Resubmit the payment
-            idempotency_key = os.urandom(16).hex()
-            body = {
-                "idempotency_key": idempotency_key,
-                "checkout": {
-                    "amount_money": {
-                        "amount": amount,
-                        "currency": "USD"
-                    },
-                    "device_options": {
-                        "device_id": SQUARE_DEVICE_ID,
-                        "skip_receipt_screen": True
-                    }
-                }
-            }
-            square_client.terminal.checkouts.create(**body)
+        start_time = time.time()
+        local_checkout_id = checkout_id  # Use a local variable for mutation
+        abort_flags[local_checkout_id] = False
+        while time.time() - start_time < 7200:  # 2 hours
+            for _ in range(24):  # Check every 5s for abort, total 2min per loop
+                if abort_flags.get(local_checkout_id):
+                    return
+                time.sleep(5)
+            # If no new transaction has occurred, check payment status
+            if last_transaction['checkout_id'] == local_checkout_id:
+                result = square_client.terminal.checkouts.get(local_checkout_id)
+                if result.errors is None:
+                    checkout = result.checkout
+                    if checkout.status == 'PENDING':
+                        square_client.terminal.checkouts.cancel(local_checkout_id)
+                        idempotency_key = os.urandom(16).hex()
+                        body = {
+                            "idempotency_key": idempotency_key,
+                            "checkout": {
+                                "amount_money": {
+                                    "amount": amount,
+                                    "currency": "USD"
+                                },
+                                "device_options": {
+                                    "device_id": SQUARE_DEVICE_ID,
+                                    "skip_receipt_screen": True
+                                }
+                            }
+                        }
+                        res = square_client.terminal.checkouts.create(**body)
+                        if res.errors is None:
+                            new_checkout = res.checkout
+                            last_transaction['checkout_id'] = new_checkout.id
+                            abort_flags[new_checkout.id] = False
+                            local_checkout_id = new_checkout.id
+                        else:
+                            return  # Stop on error
+                else:
+                    return  # Stop on error
+            else:
+                return  # Stop if a new transaction has occurred
+        # After 2 hours, cleanup
+        abort_flags.pop(local_checkout_id, None)
     threading.Thread(target=task, daemon=True).start()
+
+
+@app.route('/abort_resubmit', methods=['POST'])
+def abort_resubmit():
+    data = request.get_json()
+    checkout_id = data.get('checkout_id')
+    if checkout_id and checkout_id in abort_flags:
+        abort_flags[checkout_id] = True
+        return jsonify({"result": "Resubmission aborted."})
+    return jsonify({"error": "Invalid or missing checkout_id."}), 400
 
 
 @app.route('/pay', methods=['POST'])
@@ -228,6 +289,11 @@ def device_status():
         })
     else:
         return f"Error: {result.errors}", 400
+
+
+@app.route('/last_checkout_id')
+def last_checkout_id():
+    return jsonify({"checkout_id": last_transaction['checkout_id']})
 
 
 if __name__ == '__main__':
